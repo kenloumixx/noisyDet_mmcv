@@ -558,7 +558,6 @@ class IterBasedRunner(BaseRunner):
         # """
         # temp 
         self.bbox_check = open('save.txt', 'w')
-        self.bbox_check.close()
         
         # for splitnet
         num_cls = dataset[0].datasets[1].CLASSES    # coco class만 구하는거기 때문에 ㄱㅊ
@@ -668,7 +667,6 @@ class IterBasedRunner(BaseRunner):
 
                         # # box_ids 확인하기
                         self.bbox_check.write(f'epoch {self._epoch} | bbox ordering {splitnet_data[0][:10]}\n | len_bbox {len(splitnet_data[0])}\n')
-                        self.bbox_check.close()
                         
                         splitnet_data.append(logits_delta)
                         splitnet_data.append(loss_bbox_delta)
