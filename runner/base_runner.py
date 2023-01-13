@@ -362,7 +362,7 @@ class BaseRunner(metaclass=ABCMeta):
                 revise_keys=revise_keys)
         else:
             return load_checkpoint(
-                self.ddp_splitnet,
+                self.splitnet,
                 filename,
                 map_location,
                 strict,

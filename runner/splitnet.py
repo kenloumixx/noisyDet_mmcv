@@ -51,7 +51,9 @@ class SplitNet(torch.nn.Module):
         self.nb_classes = nb_classes
         # self.fc0 = nn.Linear(512, sz_embed)
 
-        self.fc1 = nn.Linear(162, sz_embed)  #
+        self.fc1 = nn.Linear(244, sz_embed)  #
+        self.fc1_no_delta = nn.Linear(162, sz_embed)  #
+        
         self.batch1 = torch.nn.BatchNorm1d(sz_embed)
 
         self.relu1 = nn.ReLU()
@@ -63,14 +65,21 @@ class SplitNet(torch.nn.Module):
         self.fc3 = nn.Linear(sz_embed // 2, sz_embed // 2)
         self.batch3 = torch.nn.BatchNorm1d(sz_embed // 2)
         self.relu3 = nn.ReLU()
-        self.fc6 = nn.Linear(sz_embed // 2, 2)
-
-    def forward(self, delta, logits, noisy_label, loss_bbox):  # , mask, use_mask=False
+        self.fc6 = nn.Linear(sz_embed // 2, 4)
+        
+    def forward(self, logits, noisy_label, loss_bbox, logits_delta, loss_bbox_delta, epoch): 
         noisy_label = one_hot(noisy_label, self.nb_classes) # Expected dtype int64 for index.
         loss_bbox = loss_bbox.unsqueeze(-1)
-        X = torch.cat((logits, noisy_label, loss_bbox), dim=-1)  # feature
+        loss_bbox_delta = loss_bbox_delta.unsqueeze(-1)
 
-        out_f = self.fc1(X)
+        if (epoch >= 30) or (epoch == 0):
+            X = torch.cat((logits, noisy_label, loss_bbox), dim=-1) 
+            out_f = self.fc1_no_delta(X)
+
+        else:
+            X = torch.cat((logits, noisy_label, loss_bbox, logits_delta, loss_bbox_delta), dim=-1) 
+            out_f = self.fc1(X)
+
         out_f = self.batch1(out_f)
         out_f = self.relu1(out_f)
 
@@ -81,7 +90,7 @@ class SplitNet(torch.nn.Module):
         out_f = self.fc3(out_f)
         out_f = self.batch3(out_f)
         out_f = self.relu3(out_f)
-        out_f = self.fc6(out_f)     # binary output
+        out_f = self.fc6(out_f)
 
-        return out_f    # 4,2
+        return out_f    # 4,4       # [CC, CN, NC, NN]
     
