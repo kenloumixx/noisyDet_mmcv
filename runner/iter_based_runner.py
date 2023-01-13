@@ -33,6 +33,9 @@ import torch.nn as nn
 import os
 from multiprocessing import Pool
 import time 
+import threading
+# from threading import Event
+import re 
 
 class IterLoader:
 
@@ -40,7 +43,7 @@ class IterLoader:
         rank, world_size = get_dist_info()
         self._dataloader = dataloader
         self._epoch = 0
-        self.iter_loader = iter(self._dataloader)
+        # self.iter_loader = iter(self._dataloader)
 
     @property
     def epoch(self) -> int:
@@ -275,6 +278,7 @@ class IterBasedRunner(BaseRunner):
             loss = self.splitnet_loss_func(predict, gmm_labels)
 
             if loss < 0.001:
+                print(f'{self.epoch} | loss is less than {0.001}')
                 break
 
             # self.splitnet_scaler.scale(loss).backward() 
@@ -282,13 +286,11 @@ class IterBasedRunner(BaseRunner):
 
             # self.splitnet_scaler.step(self.optimizer_splitnet)
             self.optimizer_splitnet.step()
-
             # self.splitnet_scaler.update()
-            for _ in range(logits.shape[0] * world_size):
+            for _ in range(logits.shape[0]):
                 prog_bar.update()
-
-        print('training finish!')
-
+        print(f'\nepoch {self.epoch} training finish!')
+            
     def total_tensor(self, tensor, max_num):      # 1. 패딩 2. 이어붙이기 3. 패딩 벗기기 -> max num 은 딱 패딩하기 좋은 사이즈로만..!
         rank, world_size = get_dist_info()
         # 1. padding하기 
@@ -349,12 +351,10 @@ class IterBasedRunner(BaseRunner):
             box_ids_total.extend(box_ids)
 
 
-            batch_size = loss_bbox.size(0)
-            for _ in range(logits.shape[0] * world_size):
+            for _ in range(logits.shape[0]):
                 prog_bar.update()
 
 
-        print('val finish!')
 
         '''    
         # 여기서 합치기..? <- 근데 여기는 아마 다 같을거 같은데.. 한번 확인해보기
@@ -456,68 +456,84 @@ class IterBasedRunner(BaseRunner):
         return total_clean_noise_label, total_box_ids_total_tensor
     
     # self.로 넘기기
-    def splitnet_process(self, splitnet_data, build_dataset, build_dataloader, mmdet_dataloader, cfg, splitnet_data_train_idx):    # 얘도 배치로 나눠서 하면 좋을거같은데..!
+    def splitnet_process(self, splitnet_data, build_dataset, build_dataloader, mmdet_dataloader, cfg, splitnet_data_train_idx, dataset):    # 얘도 배치로 나눠서 하면 좋을거같은데..!
         rank, world_size = get_dist_info()
-        distributed = True
-        # 여기서 splitnet_train_data 만들기
+        self.event.clear()
+        self.event_set_list = [0 for _ in range(world_size)]
 
-        splitnet_train_data = [data[splitnet_data_train_idx] for data in splitnet_data]
-        cfg.data.gmm_coco.splitnet_data = splitnet_train_data # 아니면 처음부터 애초에 여기에 넣어줘도 괜찮지 않나..?         
-        cfg.data.gmm_coco.test_mode = False
-        splitnet_train_dataset = build_dataset(cfg.data.gmm_coco)
-        len_splitnet_train_dataset = len(splitnet_train_dataset)
+        if rank == 0:
+            distributed = False
+            # 여기서 splitnet_train_data 만들기
 
-        # splitnet_dataloader = mmdet_dataloader(
-        #     splitnet_train_dataset,
-        #     cfg.data.samples_per_gpu,
-        #     cfg.data.gmm_coco.workers_per_gpu,  # let samples_per_gpu and workers_per_gpu be the same
-        #     # cfg.gpus will be ignored if distributed
-        #     len(cfg.gpu_ids),
-        #     dist=distributed,
-        #     seed=cfg.seed,
-        #     runner_type='EpochBasedRunner',
-        #     shuffle=True,
-        # )
-        splitnet_dataloader = build_dataloader(
-            splitnet_train_dataset,
-            samples_per_gpu=cfg.data.samples_per_gpu,
-            workers_per_gpu=cfg.data.workers_per_gpu,
-            dist=distributed,
-            shuffle=True,
-        )
+            splitnet_train_data = [data[splitnet_data_train_idx] for data in splitnet_data]
+            cfg.data.gmm_coco.splitnet_data = splitnet_train_data # 아니면 처음부터 애초에 여기에 넣어줘도 괜찮지 않나..?         
+            cfg.data.gmm_coco.test_mode = False
+            splitnet_train_dataset = build_dataset(cfg.data.gmm_coco)
+            len_splitnet_train_dataset = len(splitnet_train_dataset)
 
-        # training option은 COCO를 따라가기
-        for epoch in range(1):
-            self.train_splitnet_1epoch(epoch, splitnet_dataloader, len_splitnet_train_dataset)
+            splitnet_dataloader = mmdet_dataloader(
+                splitnet_train_dataset,
+                cfg.data.samples_per_gpu,
+                cfg.data.gmm_coco.workers_per_gpu,  # let samples_per_gpu and workers_per_gpu be the same
+                # cfg.gpus will be ignored if distributed
+                dist=distributed,
+                seed=cfg.seed,
+                runner_type='EpochBasedRunner',
+                shuffle=True,
+            )
+            # splitnet_dataloader = build_dataloader(
+            #     splitnet_train_dataset,
+            #     samples_per_gpu=cfg.data.samples_per_gpu,
+            #     workers_per_gpu=cfg.data.workers_per_gpu,
+            #     dist=distributed,
+            #     shuffle=True,
+            # )
 
-        cfg.data.gmm_coco.splitnet_data = splitnet_data # 아니면 처음부터 애초에 여기에 넣어줘도 괜찮지 않나..?         
-        splitnet_dataset = build_dataset(cfg.data.gmm_coco)
-        len_splitnet_dataset = len(splitnet_dataset)
+            # training option은 COCO를 따라가기
+            for epoch in range(1):
+                self.train_splitnet_1epoch(epoch, splitnet_dataloader, len_splitnet_train_dataset)
 
-        # splitnet의 output은..? <- 이제 eval모드로 바뀌고 각 box에 대해 clean/noise label을 준다. 
-        # validation용 loader 
-        # splitnet_val_dataloader = mmdet_dataloader(
-        #     splitnet_dataset,
-        #     samples_per_gpu=1,
-        #     workers_per_gpu=cfg.data.workers_per_gpu,
-        #     dist=distributed,
-        #     runner_type='EpochBasedRunner',
-        #     shuffle=False
-        # )
+            cfg.data.gmm_coco.splitnet_data = splitnet_data # 아니면 처음부터 애초에 여기에 넣어줘도 괜찮지 않나..?         
+            splitnet_dataset = build_dataset(cfg.data.gmm_coco)
+            len_splitnet_dataset = len(splitnet_dataset)
 
-        val_samples_per_gpu = cfg.data.val.pop("samples_per_gpu", 1)
-        splitnet_val_dataloader = build_dataloader(
-            splitnet_dataset,
-            samples_per_gpu=val_samples_per_gpu,
-            workers_per_gpu=cfg.data.workers_per_gpu,
-            dist=distributed,
-            shuffle=False,
-        )
+            # splitnet의 output은..? <- 이제 eval모드로 바뀌고 각 box에 대해 clean/noise label을 준다. 
+            # validation용 loader 
+            # splitnet_val_dataloader = mmdet_dataloader(
+            #     splitnet_dataset,
+            #     samples_per_gpu=1,
+            #     workers_per_gpu=cfg.data.workers_per_gpu,
+            #     dist=distributed,
+            #     runner_type='EpochBasedRunner',
+            #     shuffle=False
+            # )
 
-        splitnet_clean_noise_label, splitnet_box_ids = self.val_splitnet(splitnet_val_dataloader, len_splitnet_dataset)       # 얘는 모니터링 용도!
-        print(f'\nvalidation finish!\n')
+            val_samples_per_gpu = cfg.data.val.pop("samples_per_gpu", 1)
+            splitnet_val_dataloader = build_dataloader(
+                splitnet_dataset,
+                samples_per_gpu=val_samples_per_gpu,
+                workers_per_gpu=cfg.data.workers_per_gpu,
+                dist=distributed,
+                shuffle=False,
+            )
 
-        return splitnet_clean_noise_label, splitnet_box_ids
+            splitnet_clean_noise_label, splitnet_box_ids = self.val_splitnet(splitnet_val_dataloader, len_splitnet_dataset)       # 얘는 모니터링 용도!
+
+            self.insert_CN_label(splitnet_clean_noise_label, splitnet_box_ids, dataset)
+            
+            # 모든 gpu에 event_value = 1로 뿌리기
+            # print(f'\n\nrank {rank} set !\n\n')
+            self.event.set()
+            all_gather_object(self.event_set_list, [int(self.event.is_set())])
+            # 값들 전부 바꾸기
+        else : 
+            idx = 0
+            while True: 
+                all_gather_object(self.event_set_list, [int(self.event.is_set())])
+                if self.event_set_list[0] > 0:
+                    break
+            self.event.set()
+
 
     def run(self,
             workflow, 
@@ -541,7 +557,8 @@ class IterBasedRunner(BaseRunner):
         #         1000 iterations for validation, iteratively.
         # """
         # temp 
-        # self.f = open('save.txt', 'w')
+        self.bbox_check = open('save.txt', 'w')
+        self.bbox_check.close()
         
         # for splitnet
         num_cls = dataset[0].datasets[1].CLASSES    # coco class만 구하는거기 때문에 ㄱㅊ
@@ -550,14 +567,13 @@ class IterBasedRunner(BaseRunner):
         rank, world_size = get_dist_info()
 
         if rank == 0:
-            self.splitnet = SplitNet(80, use_delta_logit=False).to(0)   # cuda:0 is used to splitnet 
+            self.splitnet = SplitNet(80, use_delta_logit=False).to(rank)   # cuda:0 is used to splitnet 
             # self.ddp_splitnet = DDP(self.splitnet, device_ids=[rank], find_unused_parameters=True)
             # self.optimizer_splitnet = optim.AdamW(self.ddp_splitnet.parameters(), weight_decay=0.0005,
             #                         lr=0.002)  # TODO
             self.optimizer_splitnet = optim.AdamW(self.splitnet.parameters(), weight_decay=0.0005,
                                 lr=0.002)  # TODO
 
-        
             # self.splitnet_scaler = torch.cuda.amp.GradScaler()
             self.splitnet_loss_func = nn.CrossEntropyLoss()
 
@@ -598,7 +614,7 @@ class IterBasedRunner(BaseRunner):
         # train모드일 때 iter_loaders가 몇개인지 확인
         # gmm_epoch 결과 나오면 iter_loaders 대체
         self.call_hook('before_epoch')  # self.gmm_loader 
-                
+        self.event = threading.Event()
         # for trainig dataloader 
         data_loaders = [
             build_dataloader(
@@ -620,7 +636,7 @@ class IterBasedRunner(BaseRunner):
         assert isinstance(data_loaders, list)
         assert len(data_loaders) == len(workflow)
 
-        iter_loaders = [IterLoader(x) for x in data_loaders]   
+        iter_loaders = [IterLoader(x) for x in data_loaders]
 
         self._prev_epoch = -1
 
@@ -635,15 +651,15 @@ class IterBasedRunner(BaseRunner):
                     if mode == 'train' and self.iter >= self._max_iters:
                         break
                     # 시작!
-                    if self._epoch < self._prev_epoch:
+                    if self._epoch >= self._prev_epoch:
                         if rank == 0:
                             shutil.rmtree('save_dir')
                             os.mkdir('save_dir')
-                        self._prev_epoch += 1                        
                         # gmm_dataset도 train dataset 사용이기 때문에.. 엥 그래도 sup임..   -> 엥 여기서는 gmm용 training dataset을 써야하지 않나?
                         splitnet_data, splitnet_data_train_idx = self.call_hook('gmm_epoch')  # 여기서 필요한건 gmm의 label -> (0~3)                        
-                                                
-                        if self._epoch == 0:
+
+                        self._prev_epoch += 1                                            
+                        if self._prev_epoch == 0:
                             logits_delta = splitnet_data[2]
                             loss_bbox_delta = splitnet_data[1]
                         else:
@@ -651,8 +667,8 @@ class IterBasedRunner(BaseRunner):
                             loss_bbox_delta = splitnet_data[1] - prev_loss_bbox
 
                         # # box_ids 확인하기
-                        # if rank == 0:
-                        #     self.f.write(f'epoch {self._epoch} | bbox ordering {splitnet_data[0][:10]}\n | len_bbox {len(splitnet_data[0])}\n')
+                        self.bbox_check.write(f'epoch {self._epoch} | bbox ordering {splitnet_data[0][:10]}\n | len_bbox {len(splitnet_data[0])}\n')
+                        self.bbox_check.close()
                         
                         splitnet_data.append(logits_delta)
                         splitnet_data.append(loss_bbox_delta)
@@ -663,21 +679,10 @@ class IterBasedRunner(BaseRunner):
                         splitnet_data_cpu = [elem.cpu() for elem in splitnet_data]  # cpu로 만들기..!
                             
                         # 여기서 splitnet 학습시키기
-                        self._prev_epoch += 1
 
+                        '''
                         if rank == 0:
-                            new_clean_noise_label, splitnet_box_ids = self.splitnet_process(splitnet_data_cpu, build_dataset, build_dataloader, mmdet_dataloader, cfg, splitnet_data_train_idx)
-                            # splitnet의 training data인 COCO에 gmm_epoch에서 나온 CN label 넣기. 아니면 loader에 넣기. 
-                            # 여러 프로세스가 나눠서 짜고 싶음
-                            # start = time.time()
-                            # num_process = 4
-                            # pool = Pool(processes=num_process)
-
-                            # for i in range(num_process):                           
-                            #     pool.apply_async(self.insert_CN_label, (new_clean_noise_label[i::num_process], splitnet_box_ids[i::num_process], iter_loaders[0]._dataloader.dataset))
-
-                            # print(f'pool time {time.time() - start}')
-                            self.insert_CN_label(new_clean_noise_label, splitnet_box_ids, iter_loaders[0]._dataloader.dataset)  # 이거를 할 수 있음 -> 이거를.. 각자 가지고 있는 label과 box로 해결할 수 있지 않나 굳이 다 합쳐서 프로세스 여러개 돌릴 필요 없이..?
+                            self.splitnet_process(splitnet_data_cpu, build_dataset, build_dataloader, mmdet_dataloader, cfg, splitnet_data_train_idx, iter_loaders[0]._dataloader.dataset)
                             
                         while True:
                             if len(os.listdir('save_dir')) == world_size:
@@ -686,6 +691,20 @@ class IterBasedRunner(BaseRunner):
                                 f = open(f'save_dir/save_{rank}.txt', 'w')
                                 f.close()
                             time.sleep(0.1)                                
+                        '''
+                        # starting thread 1
+                        
+                        # threading.Thread(target=self.splitnet_process, args=(splitnet_data_cpu, build_dataset, build_dataloader, mmdet_dataloader, cfg, splitnet_data_train_idx, iter_loaders[0]._dataloader.dataset)).start()
+                        self.splitnet_process(splitnet_data_cpu, build_dataset, build_dataloader, mmdet_dataloader, cfg, splitnet_data_train_idx, iter_loaders[0]._dataloader.dataset)
+                        self.event.set()
+                        
+                        # print(f'\nrank {rank}')
+                        # 현재 스레드들을 group으로 묶은 다음에 t2로 설정하면 되지 않나..
+                        
+                    
+                        # wait until thread 1 is completely executed
+                        # t1.join()
+                        
                         # else:
                         #     while True:
                         #         if len(os.listdir('save_dir')) == world_size:
@@ -716,10 +735,11 @@ class IterBasedRunner(BaseRunner):
 
     def splitnet_latest_checkpoint(self, work_dir):
         path_list = os.listdir(work_dir)
-        if 'splitnet_epoch_*.path' not in path_list:
+        pattern = re.compile('splitnet_epoch_[0-9]+')
+        splitnet_path = [path for path in path_list if pattern.match(path)]
+        if len(splitnet_path) == 0:
             return None
-        splitnet_path = [path for path in path_list if 'splitnet_iter' in path]
-        last_splitnet_weight = sorted(splitnet_path, key=lambda x: int(x.split('.')[0][14:]))[-1]
+        last_splitnet_weight = sorted(splitnet_path, key=lambda x: int(x.split('.')[0][15:]))[-1]
         return last_splitnet_weight
 
     @no_type_check
@@ -811,7 +831,7 @@ class IterBasedRunner(BaseRunner):
             # meta.update(epoch=self.epoch + 1, iter=self.iter) otherwise
             # there will be problems with resumed checkpoints.
             # More details in https://github.com/open-mmlab/mmcv/pull/1108
-        meta.update(epoch=self.epoch + 1, iter=self.iter)
+        meta.update(epoch=self.epoch, iter=self.iter)
 
         filename = filename_tmpl.format(self.iter + 1)
         filepath = osp.join(out_dir, filename)
@@ -823,7 +843,8 @@ class IterBasedRunner(BaseRunner):
 
         save_checkpoint(self.model, filepath, optimizer=optimizer, meta=meta)
         # save_checkpoint(self.ddp_splitnet, splitnet_filepath, optimizer=self.optimizer_splitnet)  # for checkpoint
-        save_checkpoint(self.splitnet, splitnet_filepath, optimizer=self.optimizer_splitnet)  # for checkpoint
+        if self.epoch > 0:
+            save_checkpoint(self.splitnet, splitnet_filepath, optimizer=self.optimizer_splitnet)  # for checkpoint
 
         # in some environments, `os.symlink` is not supported, you may need to
         # set `create_symlink` to False
