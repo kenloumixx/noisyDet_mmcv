@@ -584,12 +584,7 @@ class IterBasedRunner(BaseRunner):
             if cfg.get("auto_resume", True):
                 resume_from = self.splitnet_latest_checkpoint(cfg.work_dir)  # should be path
             if resume_from is not None:
-                cfg.resume_from = resume_from
-
-            if cfg.resume_from:
-                self.resume(osp.join(cfg.work_dir, cfg.resume_from), splitnet=True) # load from 대신 latest checkpoint 안에서 path 조정하기..
-            elif cfg.load_from: # not yet
-                self.load_checkpoint(cfg.load_from)
+                self.resume(osp.join(cfg.work_dir, resume_from), splitnet=True) # load from 대신 latest checkpoint 안에서 path 조정하기..
 
 
             find_unused_parameters = cfg.get("find_unused_parameters", False)        
@@ -844,8 +839,7 @@ class IterBasedRunner(BaseRunner):
 
         save_checkpoint(self.model, filepath, optimizer=optimizer, meta=meta)
         # save_checkpoint(self.ddp_splitnet, splitnet_filepath, optimizer=self.optimizer_splitnet)  # for checkpoint
-        if self.epoch > 0:
-            save_checkpoint(self.splitnet, splitnet_filepath, optimizer=self.optimizer_splitnet)  # for checkpoint
+        save_checkpoint(self.splitnet, splitnet_filepath, optimizer=self.optimizer_splitnet)  # for checkpoint
 
         # in some environments, `os.symlink` is not supported, you may need to
         # set `create_symlink` to False
