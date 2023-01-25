@@ -72,7 +72,7 @@ class SplitNet(torch.nn.Module):
         loss_bbox = loss_bbox.unsqueeze(-1)
         loss_bbox_delta = loss_bbox_delta.unsqueeze(-1)
 
-        if (epoch >= 30) or (epoch == 0):
+        if (epoch >= 6) or (epoch == 0):
             X = torch.cat((logits, noisy_label, loss_bbox), dim=-1) 
             out_f = self.fc1_no_delta(X)
 

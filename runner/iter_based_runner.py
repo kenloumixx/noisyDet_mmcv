@@ -36,11 +36,11 @@ import time
 import threading
 # from threading import Event
 import re 
+import json
 
 class IterLoader:
 
     def __init__(self, dataloader: DataLoader):
-        rank, world_size = get_dist_info()
         self._dataloader = dataloader
         self._epoch = 0
         # self.iter_loader = iter(self._dataloader)
@@ -50,7 +50,6 @@ class IterLoader:
         return self._epoch
 
     def make_iter(self):
-        rank, _ = get_dist_info()
         self.iter_loader = iter(self._dataloader)
 
     def __next__(self):
@@ -58,6 +57,9 @@ class IterLoader:
             data = next(self.iter_loader)
         except StopIteration:
             self._epoch += 1
+            rank, world_size = get_dist_info()  
+            if rank == 0:
+                print(f'\n epoch plus tobe {self._epoch}!\n')
             if hasattr(self._dataloader.sampler, 'set_epoch'):
                 self._dataloader.sampler.set_epoch(self._epoch)
             time.sleep(2)  # Prevent possible deadlock during epoch transition
@@ -255,10 +257,13 @@ class IterBasedRunner(BaseRunner):
             dataset[idx]['box_ids'] = label.item()
     '''
 
-    def insert_CN_label(self, clean_noise_label, bbox_ids, dataset):    # dataset은 training에 사용될 예정
-        for bbox_idx, label in zip(bbox_ids, clean_noise_label): # 여기서 확인해보기
+    def insert_CN_label(self, clean_noise_label, bbox_ids, GMM_GT_idx, dataset):    # dataset은 training에 사용될 예정
+        for bbox_idx, label, gmm_gt in zip(bbox_ids, clean_noise_label, GMM_GT_idx): # 여기서 확인해보기
             dataset.sup.coco.anns[bbox_idx.item()]['gmm_labels'] = label
             dataset.unsup.coco.anns[bbox_idx.item()]['gmm_labels'] = label
+
+            dataset.sup.coco.anns[bbox_idx.item()]['GMM_GT_idx'] = gmm_gt.item()
+            dataset.unsup.coco.anns[bbox_idx.item()]['GMM_GT_idx'] = gmm_gt.item()
         
     def train_splitnet_1epoch(self, epoch, dataloader, len_dataset):
         # self.ddp_splitnet.train()
@@ -267,8 +272,8 @@ class IterBasedRunner(BaseRunner):
         prog_bar = mmcv.ProgressBar(len_dataset)
         
         for batch_idx, data in enumerate(dataloader): # TODO 왜 여기서 cuda:0으로 들어가는걸까.. -> data loader - sampler안에서 dist모드면 cuda rank를 재배정. 따라서 data가 loader에 들어갈 때는 무조건 cpu로 들어가야 함!
-            if batch_idx >= len(dataloader):
-                break
+            # if batch_idx >= len(dataloader):
+            #     break
             logits, noisy_label, loss_bbox, gmm_labels, logits_delta, loss_bbox_delta = data['logits'], data['cls_labels'], data['loss_bbox'], data['gmm_labels'], data['logits_delta'], data['loss_bbox_delta']
             logits, noisy_label, loss_bbox, gmm_labels, logits_delta, loss_bbox_delta = logits.to(rank), noisy_label.to(rank), loss_bbox.to(rank), gmm_labels.to(rank), logits_delta.to(rank), loss_bbox_delta.to(rank)
             self.optimizer_splitnet.zero_grad()
@@ -278,7 +283,7 @@ class IterBasedRunner(BaseRunner):
             loss = self.splitnet_loss_func(predict, gmm_labels)
 
             if loss < 0.001:
-                print(f'{self.epoch} | loss is less than {0.001}')
+                print(f'\n{self._iter} | loss is less than {0.001}\n')
                 break
 
             # self.splitnet_scaler.scale(loss).backward() 
@@ -289,7 +294,7 @@ class IterBasedRunner(BaseRunner):
             # self.splitnet_scaler.update()
             for _ in range(logits.shape[0]):
                 prog_bar.update()
-        print(f'\nepoch {self.epoch} training finish!')
+        print(f'\niter {self._iter} training finish!\n')
             
     def total_tensor(self, tensor, max_num):      # 1. 패딩 2. 이어붙이기 3. 패딩 벗기기 -> max num 은 딱 패딩하기 좋은 사이즈로만..!
         rank, world_size = get_dist_info()
@@ -333,8 +338,8 @@ class IterBasedRunner(BaseRunner):
         prog_bar = mmcv.ProgressBar(len_dataset)
 
         for batch_idx, data in enumerate(dataloader):
-            if batch_idx >= len(dataloader):
-                break
+            # if batch_idx >= len(dataloader):
+            #     break
             logits, noisy_label, loss_bbox, box_ids, logits_delta, loss_bbox_delta = data['logits'], data['cls_labels'], data['loss_bbox'], data['box_ids'], data['logits_delta'], data['loss_bbox_delta']
             logits, noisy_label, loss_bbox, box_ids, logits_delta, loss_bbox_delta = logits.to(rank), noisy_label.to(rank), loss_bbox.to(rank), box_ids.to(rank), logits_delta.to(rank), loss_bbox_delta.to(rank)
             
@@ -349,7 +354,7 @@ class IterBasedRunner(BaseRunner):
             prob_total.extend(prob)
             maxidx_total.extend(maxidx)
             box_ids_total.extend(box_ids)
-
+            
             for _ in range(logits.shape[0]):
                 prog_bar.update()
 
@@ -452,17 +457,22 @@ class IterBasedRunner(BaseRunner):
 
         return clean_noise_label, box_ids_total_tensor
         '''
+        del predict_total, prob_total, maxidx_total, box_ids_total
         return total_clean_noise_label, total_box_ids_total_tensor
     
     # self.로 넘기기
-    def splitnet_process(self, splitnet_data, build_dataset, build_dataloader, mmdet_dataloader, cfg, splitnet_data_train_idx, dataset):    # 얘도 배치로 나눠서 하면 좋을거같은데..!
+    def splitnet_process(self, splitnet_data, build_dataset, build_dataloader, mmdet_dataloader, cfg, splitnet_data_train_idx, dataset, GMM_GT_idx):    # 얘도 배치로 나눠서 하면 좋을거같은데..!
         rank, world_size = get_dist_info()
         # self.event.clear()
         self.merge_value = 0
         self.event_set_list = [0 for _ in range(world_size)]
 
         if rank == 0:
-            print(f'splitnet process start {self._epoch} | {self._prev_epoch}')
+            self.splitnet = SplitNet(80, use_delta_logit=False).to(rank)   # cuda:0 is used to splitnet     # 매번 새로 선언하고 training
+            self.optimizer_splitnet = optim.AdamW(self.splitnet.parameters(), weight_decay=0.0005,
+                                lr=0.002)  # TODO
+            self.splitnet_loss_func = nn.CrossEntropyLoss()
+            print(f'\nsplitnet process start {self._iter} | \n')
             distributed = False
             # 여기서 splitnet_train_data 만들기
 
@@ -482,14 +492,6 @@ class IterBasedRunner(BaseRunner):
                 runner_type='EpochBasedRunner',
                 shuffle=True,
             )
-            # splitnet_dataloader = build_dataloader(
-            #     splitnet_train_dataset,
-            #     samples_per_gpu=cfg.data.samples_per_gpu,
-            #     workers_per_gpu=cfg.data.workers_per_gpu,
-            #     dist=distributed,
-            #     shuffle=True,
-            # )
-
             # training option은 COCO를 따라가기
             for epoch in range(1):
                 self.train_splitnet_1epoch(epoch, splitnet_dataloader, len_splitnet_train_dataset)
@@ -497,17 +499,6 @@ class IterBasedRunner(BaseRunner):
             cfg.data.gmm_coco.splitnet_data = splitnet_data # 아니면 처음부터 애초에 여기에 넣어줘도 괜찮지 않나..?         
             splitnet_dataset = build_dataset(cfg.data.gmm_coco)
             len_splitnet_dataset = len(splitnet_dataset)
-
-            # splitnet의 output은..? <- 이제 eval모드로 바뀌고 각 box에 대해 clean/noise label을 준다. 
-            # validation용 loader 
-            # splitnet_val_dataloader = mmdet_dataloader(
-            #     splitnet_dataset,
-            #     samples_per_gpu=val_samples_per_gpu,
-            #     workers_per_gpu=cfg.data.workers_per_gpu,
-            #     dist=distributed,
-            #     runner_type='EpochBasedRunner',
-            #     shuffle=False
-            # )
             
             # val_samples_per_gpu = cfg.data.val.pop("samples_per_gpu", 1)
             splitnet_val_dataloader = build_dataloader(
@@ -520,7 +511,10 @@ class IterBasedRunner(BaseRunner):
 
             splitnet_clean_noise_label, splitnet_box_ids = self.val_splitnet(splitnet_val_dataloader, len_splitnet_dataset)       # 얘는 모니터링 용도!
 
-            self.insert_CN_label(splitnet_clean_noise_label, splitnet_box_ids, dataset)
+            self.insert_CN_label(splitnet_clean_noise_label, splitnet_box_ids, GMM_GT_idx, dataset)
+            del splitnet_clean_noise_label, splitnet_box_ids, GMM_GT_idx
+            del splitnet_dataloader, splitnet_val_dataloader, splitnet_dataset, splitnet_train_data
+
 
             # 모든 gpu에 event_value = 1로 뿌리기
             # print(f'\n\nrank {rank} set !\n\n')
@@ -536,6 +530,10 @@ class IterBasedRunner(BaseRunner):
                 if self.event_set_list[0] > 0:
                     break
             # self.event.set()
+        
+        dist.barrier()
+        # dataloader.make_iter()
+        
         
     def run(self,
             workflow, 
@@ -565,31 +563,6 @@ class IterBasedRunner(BaseRunner):
         num_cls = dataset[0].datasets[1].CLASSES    # coco class만 구하는거기 때문에 ㄱㅊ
         self.splitnet_batch_size = 128  # TODO  # 32, 64, 128
 
-        if rank == 0:
-            self.bbox_check = open('save.txt', 'w')
-
-            self.splitnet = SplitNet(80, use_delta_logit=False).to(rank)   # cuda:0 is used to splitnet 
-            # self.ddp_splitnet = DDP(self.splitnet, device_ids=[rank], find_unused_parameters=True)
-            # self.optimizer_splitnet = optim.AdamW(self.ddp_splitnet.parameters(), weight_decay=0.0005,
-            #                         lr=0.002)  # TODO
-            self.optimizer_splitnet = optim.AdamW(self.splitnet.parameters(), weight_decay=0.0005,
-                                lr=0.002)  # TODO
-            # self.optimizer_splitnet = optim.AdamW(self.splitnet.parameters(), weight_decay=0.0005,
-                                # lr=0.002)  # TODO
-
-            # self.splitnet_scaler = torch.cuda.amp.GradScaler()
-            self.splitnet_loss_func = nn.CrossEntropyLoss()
-
-            resume_from = None
-            if cfg.get("auto_resume", True):
-                resume_from = self.splitnet_latest_checkpoint(cfg.work_dir)  # should be path
-            if resume_from is not None:
-                self.resume(osp.join(cfg.work_dir, resume_from), splitnet=True) # load from 대신 latest checkpoint 안에서 path 조정하기..
-
-
-            find_unused_parameters = cfg.get("find_unused_parameters", False)        
-
-
         assert mmcv.is_list_of(workflow, tuple)
         if max_iters is not None:
             warnings.warn(
@@ -607,7 +580,7 @@ class IterBasedRunner(BaseRunner):
         self.logger.info('workflow: %s, max: %d iters', workflow,
                          self._max_iters)
         self.call_hook('before_run')
-
+        
         # 한 에폭이 바뀔 때마다 loader를 여기서 갈아끼워주기
         # train모드일 때 iter_loaders가 몇개인지 확인
         # gmm_epoch 결과 나오면 iter_loaders 대체
@@ -629,14 +602,14 @@ class IterBasedRunner(BaseRunner):
         ]   
 
         sampler = cfg.data.get("sampler", {}).get("train", {})
-
+        self.start = True
 
         assert isinstance(data_loaders, list)
         assert len(data_loaders) == len(workflow)
 
         iter_loaders = [IterLoader(x) for x in data_loaders]
 
-        self._prev_epoch = -1
+        self.bbox_check = open('save.txt', 'w')
 
         while self.iter < self._max_iters:
             for i, flow in enumerate(workflow):
@@ -647,32 +620,51 @@ class IterBasedRunner(BaseRunner):
                     if mode == 'train' and self.iter >= self._max_iters:
                         break
                     # 시작!
-                    if self._epoch > self._prev_epoch:
+                    if ((self.iter+1) % 7350 == 0) or self.start:
+                        # print(f'self.iter {self.iter}') # 2000에서 저장된걸 가져왔을 때 self.iter는 실제로 얼마일까?    # 오키 1999라고 함
+                        # exit()
                         if rank == 0:
-                            shutil.rmtree('save_dir')
-                            os.mkdir('save_dir')
+                            print(f'rank {rank} | self._iter {self.iter} | self._iter {self._iter} | self._inner_iter {self._inner_iter}')
                         # gmm_dataset도 train dataset 사용이기 때문에.. 엥 그래도 sup임..   -> 엥 여기서는 gmm용 training dataset을 써야하지 않나?
-                        splitnet_data, splitnet_data_train_idx = self.call_hook('gmm_epoch')  # 여기서 필요한건 gmm의 label -> (0~3)                        
+                        splitnet_data, splitnet_data_train_idx, GMM_GT_idx = self.call_hook('gmm_epoch')  # 여기서 필요한건 gmm의 label -> (0~3)                        
 
-                        if self._prev_epoch == -1:
+                        if (self.iter+1) // 7350 == 0:  # 첫번째로 걸렸거나 아니면 그보다 작거나 
                             logits_delta = splitnet_data[2]
                             loss_bbox_delta = splitnet_data[1]
-                        else:
+
+                            # prev_logits = splitnet_data[2]
+                            # prev_loss_bbox = splitnet_data[1]
+
+                        else:   # 여기서부터는 delta가 반영되야 함. # self.start거나 아니면 7350에 2번째로 걸렸거나 
+                            if self.start:  # 아예 시작하는 바람에 메모리에 안올라와있으면
+                                if os.path.exists("splitnet_delta.json"):
+                                    with open("splitnet_delta.json", "r") as json_file: 
+                                        splitnet_delta = json.load(json_file)
+                                        if rank == 0:
+                                            print('\nsplitnet json file loaded! \n')
+                                    prev_logits = torch.tensor(splitnet_delta['prev_logits']).to(rank)
+                                    prev_loss_bbox = torch.tensor(splitnet_delta['prev_loss_bbox']).to(rank)
+
                             logits_delta = splitnet_data[2] - prev_logits
                             loss_bbox_delta = splitnet_data[1] - prev_loss_bbox
-                        self._prev_epoch += 1                                            
-
-                        # # box_ids 확인하기
-                        if rank == 0:
-                            self.bbox_check.write(f'epoch {self._epoch} | bbox ordering {splitnet_data[0][:10]}\n | len_bbox {len(splitnet_data[0])}\n')
                         
                         splitnet_data.append(logits_delta)
                         splitnet_data.append(loss_bbox_delta)
-                            
-                        prev_logits = splitnet_data[2]
+
+                        prev_logits = splitnet_data[2]  # 여기서 값이 바뀌나..? -> 테스트햇을땐 안바뀜므
                         prev_loss_bbox = splitnet_data[1]
+
                             
+                        if rank == 0:
+                            if ((self.iter+1) % 7350 == 0) or ((self.iter+1) == 2000):     # 아니면 따로 저장할 필요 없음.. 어차피 이건 load해올 때와만 관련된 것잉게..
+                                # with open("history.json", "w") as json_file: 
+                                with open("splitnet_delta.json", "w") as json_file: 
+                                    json.dump({'iter': self.iter+1, 'prev_logits': splitnet_data[2].cpu().numpy().tolist(), 'prev_loss_bbox': splitnet_data[1].cpu().numpy().tolist()}, json_file)
+                                    print('\nsplitnet json file dumped! \n')
+                                
                         splitnet_data_cpu = [elem.cpu() for elem in splitnet_data]  # cpu로 만들기..!
+                        del splitnet_data
+                        # splitnet_data_cpu.append(GMM_GT_idx)
                             
                         # 여기서 splitnet 학습시키기
 
@@ -691,12 +683,10 @@ class IterBasedRunner(BaseRunner):
                         # starting thread 1
                         
                         # threading.Thread(target=self.splitnet_process, args=(splitnet_data_cpu, build_dataset, build_dataloader, mmdet_dataloader, cfg, splitnet_data_train_idx, iter_loaders[0]._dataloader.dataset)).start()
-                        self.splitnet_process(splitnet_data_cpu, build_dataset, build_dataloader, mmdet_dataloader, cfg, splitnet_data_train_idx, iter_loaders[0]._dataloader.dataset)
+                        self.splitnet_process(splitnet_data_cpu, build_dataset, build_dataloader, mmdet_dataloader, cfg, splitnet_data_train_idx, iter_loaders[0]._dataloader.dataset, GMM_GT_idx)
                         # self.event.set()
-                        
-                        print(f'\nrank {rank}')
                         # 현재 스레드들을 group으로 묶은 다음에 t2로 설정하면 되지 않나..
-                        
+                        del splitnet_data_cpu
                     
                         # wait until thread 1 is completely executed
                         # t1.join()
@@ -713,7 +703,9 @@ class IterBasedRunner(BaseRunner):
                         #                 f.close()
                         #         time.sleep(0.1)
                         # 여기서 rank 모이고
-                        iter_loaders[0].make_iter()
+                        if self.start:
+                            iter_loaders[0].make_iter()
+                            self.start = False
 
                     # 끝!
                     # insert하는건 probability 4-dim  -> new_clean_noise_label이 4dim짜리 tensor인거 확인하면 됨
@@ -827,19 +819,17 @@ class IterBasedRunner(BaseRunner):
             # meta.update(epoch=self.epoch + 1, iter=self.iter) otherwise
             # there will be problems with resumed checkpoints.
             # More details in https://github.com/open-mmlab/mmcv/pull/1108
-        meta.update(epoch=self.epoch, iter=self.iter)
+        meta.update(epoch=self.epoch + 1, iter=self.iter)
 
         filename = filename_tmpl.format(self.iter + 1)
         filepath = osp.join(out_dir, filename)
         
         optimizer = self.optimizer if save_optimizer else None
-        optimizer_splitnet = self.optimizer_splitnet if save_optimizer else None
-
-        splitnet_filepath = osp.join(self.work_dir, f'splitnet_epoch_{self._epoch}.pth')
+        # optimizer_splitnet = self.optimizer_splitnet if save_optimizer else None
+        # splitnet_filepath = osp.join(self.work_dir, f'splitnet_epoch_{self._epoch}.pth')
 
         save_checkpoint(self.model, filepath, optimizer=optimizer, meta=meta)
         # save_checkpoint(self.ddp_splitnet, splitnet_filepath, optimizer=self.optimizer_splitnet)  # for checkpoint
-        save_checkpoint(self.splitnet, splitnet_filepath, optimizer=self.optimizer_splitnet)  # for checkpoint
 
         # in some environments, `os.symlink` is not supported, you may need to
         # set `create_symlink` to False
